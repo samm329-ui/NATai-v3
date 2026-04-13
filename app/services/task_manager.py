@@ -35,7 +35,7 @@ class TaskManager:
         self,
         intent_type: str,
         payload: dict,
-        chat_history: Optional[List[Tuple]] = None
+        chat_history: Optional[List[tuple]] = None
     ) -> str:
         task_id = str(uuid.uuid4())[:8]
         prompt = payload.get("prompt", payload.get("message", ""))[:200]
