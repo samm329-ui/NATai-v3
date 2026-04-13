@@ -19,7 +19,7 @@ Say "generate an image of..." and Natasha creates it using Pollinations.ai. No A
 Send a photo or use your webcam. Natasha analyzes the image and answers questions about it using Llama 4 Scout (free via Groq).
 
 ### Text-to-Speech
-The AI speaks its responses as they stream in. Uses Microsoft Edge's TTS (free, no API key). First sentence starts playing before the full response is done.
+The AI speaks its responses as they stream in. Uses Microsoft Edge's TTS (free, no API key). Sentences are submitted to TTS as soon as they complete, so speech starts before the full response is done.
 
 ### Voice Input
 Click the mic and speak your question. It auto-sends when you stop talking. Works in Chrome and Safari.
@@ -28,7 +28,7 @@ Click the mic and speak your question. It auto-sends when you stop talking. Work
 Put `.txt` files in `database/learning_data/` with any personal information you want Natasha to know. It reads them at startup and uses them as context when answering your questions.
 
 ### Session Persistence
-Conversations are saved to disk. If you restart the server, your chat history is still there.
+Conversations are saved to disk. If you restart the server, your chat history is still there. Chat memory is also indexed into the vector store for retrieval during future conversations.
 
 ### Multiple API Keys
 Set `GROQ_API_KEY_2`, `GROQ_API_KEY_3`, etc. in `.env` for automatic fallback. If one key hits its rate limit, Natasha switches to the next one automatically.
@@ -142,13 +142,13 @@ NATASHA/
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `GROQ_API_KEY` | Yes | — | Your primary Groq API key |
-| `GROQ_API_KEY_2`, `_3`, ... | No | — | Extra keys for auto-fallback |
+| `GROQ_API_KEY_2`, `_3`, ... | No | — | Extra keys for round-robin rotation |
 | `TAVILY_API_KEY` | No | — | Tavily key for web search |
 | `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | Main chat model |
 | `ASSISTANT_NAME` | No | `Natasha` | Name of the assistant |
 | `NATASHA_USER_TITLE` | No | — | How AI addresses you (e.g. "Sir") |
 | `NATASHA_OWNER_NAME` | No | — | Your name (so AI knows who it serves) |
-| `TTS_VOICE` | No | `en-GB-RyanNeural` | Text-to-speech voice |
+| `TTS_VOICE` | No | `en-US-AvaNeural` | Text-to-speech voice |
 | `TTS_RATE` | No | `+22%` | Speech speed |
 
 Run `edge-tts --list-voices` to see all available TTS voices.
@@ -159,11 +159,11 @@ Run `edge-tts --list-voices` to see all available TTS voices.
 
 | Endpoint | What it does |
 |---|---|
-| `POST /chat/stream` | General mode — streaming response |
-| `POST /chat/realtime/stream` | Realtime mode — web search + streaming |
+| `POST /chat/stream` | General mode — streaming response, answers from knowledge |
+| `POST /realtime/stream` | Realtime mode — web search + streaming |
 | `POST /chat/natasha/stream` | Natasha mode — auto-routes, streaming |
 | `POST /chat` | General mode — non-streaming |
-| `POST /chat/realtime` | Realtime mode — non-streaming |
+| `POST /realtime` | Realtime mode — non-streaming |
 | `GET /chat/history/{session_id}` | Get full chat history for a session |
 | `POST /tts` | Generate speech audio for any text |
 | `GET /health` | Check server and service status |
