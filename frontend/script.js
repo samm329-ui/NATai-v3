@@ -9,12 +9,16 @@ let isStreaming = false;
 let isListening = false;
 let camStream = null;
 let autoListenMode = false;
+let ttsCooldown = false;
+let ttsCooldownTimeout = null;
 const SPEECH_ERROR_MAX_RETRIES = 3;
 let speechErrorRetryCount = 0;
 const SPEECH_SEND_DELAY_MS = 500;
 const SPEECH_RESTART_DELAY_MS = 700;
+const TTS_COOLDOWN_MS = 2000;
 let speechSendTimeout = null;
 let pendingSendTranscript = null;
+let lastAssistantResponse = '';
 let safariVoiceHintShown = false;
 let orb = null;
 let recognition = null;
@@ -158,6 +162,13 @@ class TTSPlayer {
         this.playing = true;
         this._loopId = (this._loopId || 0) + 1;
         const myId = this._loopId;
+        
+        // Aggressively stop listening and set cooldown IMMEDIATELY
+        ttsCooldown = true;
+        if (ttsCooldownTimeout) clearTimeout(ttsCooldownTimeout);
+        if (isListening) stopListening();
+        if (recognition) { try { recognition.abort(); } catch(_){} }
+        
         if (ttsBtn) ttsBtn.classList.add('tts-speaking');
         if (orbContainer) orbContainer.classList.add('speaking');
         if (orb) orb.setActive(true);
@@ -178,6 +189,16 @@ class TTSPlayer {
         if (ttsBtn) ttsBtn.classList.remove('tts-speaking');
         if (orbContainer) orbContainer.classList.remove('speaking');
         if (orb) orb.setActive(false);
+        
+        // Long cooldown: TTS audio echoes in room for several seconds
+        ttsCooldownTimeout = setTimeout(() => {
+            ttsCooldown = false;
+            ttsCooldownTimeout = null;
+            if (autoListenMode && !isStreaming && !isListening && recognition) {
+                startListening();
+            }
+        }, TTS_COOLDOWN_MS);
+        
         if (typeof this.onPlaybackComplete === 'function') this.onPlaybackComplete();
     }
     _playB64(b64) {
@@ -279,9 +300,37 @@ function isSafariOrIOS() {
         (/Safari/.test(ua) && !/Chrome|Chromium|CriOS/.test(ua));
 }
 
-function initSpeech() {
+function isBrave() {
+    if (typeof navigator === 'undefined') return false;
+    return (navigator.brave && typeof navigator.brave.isBrave === 'function') ||
+        /Brave/.test(navigator.userAgent);
+}
+
+async function detectBrave() {
+    if (navigator.brave && typeof navigator.brave.isBrave === 'function') {
+        try { return await navigator.brave.isBrave(); } catch (_) { return false; }
+    }
+    return false;
+}
+
+async function initSpeech() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) { micBtn.title = 'Speech not supported in this browser'; return; }
+    if (!SR) { 
+        console.warn('[SPEECH] SpeechRecognition not available in this browser');
+        micBtn.title = 'Speech not supported in this browser. Use Chrome or Edge.'; 
+        return; 
+    }
+    
+    const brave = await detectBrave();
+    if (brave) {
+        showToast('Brave browser blocks voice input by default. Go to brave://settings/shields and disable "Block fingerprinting" for localhost, or use Chrome/Edge.', 8000);
+        micBtn.title = 'Voice input — Brave may block this. Click for details.';
+        micBtn.addEventListener('click', () => {
+            showToast('Fix: Open brave://settings/shields → Find localhost → Turn OFF "Block fingerprinting" → Reload page', 10000);
+        }, { once: true });
+    }
+    
+    console.log('[SPEECH] SpeechRecognition API found, initializing...');
     recognition = new SR();
     const safariMode = isSafariOrIOS();
     recognition.continuous = false;
@@ -289,15 +338,41 @@ function initSpeech() {
     recognition.maxAlternatives = 1;
     recognition.lang = 'en-US';
     recognition.onresult = e => {
+        console.log('[SPEECH] onresult fired, results:', e.results.length);
         if (!e.results || e.results.length === 0) return;
         const last = e.results[e.results.length - 1];
         const transcript = (last && last[0]) ? last[0].transcript.trim() : '';
         const isFinal = last && last.isFinal;
+        console.log('[SPEECH] transcript:', transcript, 'isFinal:', isFinal, 'cooldown:', ttsCooldown);
+        
+        // Filter out TTS feedback: ignore speech during TTS cooldown
+        if (ttsCooldown) {
+            console.log('[SPEECH] Ignoring during TTS cooldown');
+            return;
+        }
+        
+        // Filter out self-listening: if transcript closely matches last AI response, discard
+        if (lastAssistantResponse && transcript.length > 5) {
+            const clean = s => s.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2);
+            const aiWords = new Set(clean(lastAssistantResponse));
+            const speechWords = clean(transcript);
+            let matchCount = 0;
+            for (const w of speechWords) {
+                if (aiWords.has(w)) matchCount++;
+            }
+            const overlap = matchCount / Math.max(speechWords.length, 1);
+            if ((overlap > 0.35 && speechWords.length >= 3) || (matchCount >= 3 && speechWords.length <= 10)) {
+                console.log('[SPEECH] Filtered self-listening (overlap:', Math.round(overlap * 100) + '%, matches:', matchCount, '/', speechWords.length, ')');
+                return;
+            }
+        }
+        
         if (speechWidgetText) speechWidgetText.textContent = transcript;
         if (speechWidget) speechWidget.classList.add('visible');
         if (settings.voiceInterrupt && ttsPlayer && ttsPlayer.playing && transcript.length > 0) {
             ttsPlayer.stop();
             ttsPlayer.stopped = false;
+            ttsCooldown = false;
         }
         if (isFinal && transcript) {
             pendingSendTranscript = transcript;
@@ -317,13 +392,21 @@ function initSpeech() {
         }
     };
 
-    recognition.onstart = () => { speechErrorRetryCount = 0; };
+    recognition.onstart = () => { 
+        console.log('[SPEECH] Recognition started');
+        speechErrorRetryCount = 0; 
+    };
     recognition.onerror = e => {
+        console.error('[SPEECH] Error:', e.error, e);
         stopListening();
         const msg = (e && e.error) ? String(e.error) : '';
         const isPermissionDenied = /denied|not-allowed|permission/i.test(msg);
         if (isPermissionDenied && micBtn) {
             micBtn.title = 'Microphone access denied. Allow in browser settings.';
+            speechErrorRetryCount = SPEECH_ERROR_MAX_RETRIES;
+            showToast('Microphone access denied. Please allow mic access in browser settings.');
+        } else if (msg === 'not-allowed' || msg === 'service-not-allowed') {
+            showToast('Voice input blocked by browser. ' + (brave ? 'In Brave, go to brave://settings/shields → disable "Block fingerprinting" for localhost.' : 'Try Chrome or Edge.'), 8000);
             speechErrorRetryCount = SPEECH_ERROR_MAX_RETRIES;
         }
         if (autoListenMode && !isStreaming && speechErrorRetryCount < SPEECH_ERROR_MAX_RETRIES) {
@@ -335,6 +418,7 @@ function initSpeech() {
     };
 
     recognition.onend = () => {
+        console.log('[SPEECH] Recognition ended');
         if (pendingSendTranscript) {
             clearTimeout(speechSendTimeout);
             speechSendTimeout = null;
@@ -386,13 +470,14 @@ function stopListening() {
 function maybeRestartListening() {
     if (!autoListenMode || !recognition) return;
     if (isStreaming) return;
+    if (ttsCooldown) return;
 
     const ttsActive = ttsPlayer && (ttsPlayer.playing || ttsPlayer.queue.length > 0);
     if (ttsActive && !settings.voiceInterrupt) return;
 
     const delay = ttsActive ? 150 : SPEECH_RESTART_DELAY_MS;
     setTimeout(() => {
-        if (autoListenMode && !isStreaming && !isListening && recognition) {
+        if (autoListenMode && !isStreaming && !isListening && !ttsCooldown && recognition) {
             startListening();
         }
     }, delay);
@@ -1394,15 +1479,17 @@ async function sendMessage(textOverride) {
                     }
                     if ('chunk' in data) {
                         const chunkText = data.chunk || '';
-                        if (chunkText && !firstChunkReceived) {
+                        if (typeof chunkText === 'string' && chunkText && !firstChunkReceived) {
                             firstChunkReceived = true;
                             if (ttsPlayer) ttsPlayer.reset();
                         }
-                        fullResponse += chunkText;
-                        const textSpan = contentEl.querySelector('.msg-stream-text');
-                        if (textSpan) {
-                            textSpan.textContent = fullResponse;
-                            textSpan.classList.remove('stream-placeholder');
+                        if (typeof chunkText === 'string') {
+                            fullResponse += chunkText;
+                            const textSpan = contentEl.querySelector('.msg-stream-text');
+                            if (textSpan) {
+                                textSpan.textContent = fullResponse;
+                                textSpan.classList.remove('stream-placeholder');
+                            }
                         }
                         if (!cursorEl) {
                             cursorEl = document.createElement('span');
