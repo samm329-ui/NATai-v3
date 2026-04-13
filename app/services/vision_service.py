@@ -1,13 +1,27 @@
 import base64
+import threading
 from typing import Optional, List, Dict
 
-from app.config import (
-    GROQ_API_KEYS, GROQ_VISION_MODEL
-)
+from app.config import GROQ_API_KEYS, GROQ_VISION_MODEL
 import app.services.decision_types
 
 import logging
+
 logger = logging.getLogger("J.A.R.V.I.S")
+
+_vision_key_counter = 0
+_vision_counter_lock = threading.Lock()
+
+
+def _get_next_vision_key():
+    global _vision_key_counter
+    if not GROQ_API_KEYS:
+        return None
+    with _vision_counter_lock:
+        idx = _vision_key_counter % len(GROQ_API_KEYS)
+        _vision_key_counter += 1
+        return GROQ_API_KEYS[idx]
+
 
 VISION_SYSTEM_PROMPT = """You are analyzing a live camera image from the user. Your job is to describe what you see clearly and specifically.
 
@@ -23,98 +37,82 @@ RULES:
 - When asked to identify a product, brand, or logo: Name it specifically if you can recognize it.
 - Do not use asterisks, emojis, or markdown formatting. Use plain text with standard punctuation."""
 
+
 class VisionService:
     def __init__(self):
-        self.groq_client = None
-        self._init_client()
-        
-    def _init_client(self):
-        if GROQ_API_KEYS:
-            try:
-                from groq import Groq
-                self.groq_client = Groq(api_key=GROQ_API_KEYS[0])
-                logger.info("[VISION] Groq vision initialized (%s)", GROQ_VISION_MODEL)
-            except Exception as e:
-                logger.warning("[VISION] Groq client init failed: %s", e)
-        else:
-            logger.warning("[VISION] No vision available. Please set GROQ_API_KEY.")
-            
+        pass
+
     def describe_image(
         self, img_base64: str, prompt: Optional[str] = None
     ) -> Optional[str]:
-    
-        if not self.groq_client:
+
+        api_key = _get_next_vision_key()
+        if not api_key:
             return "Vision is not available. Please set GROQ_API_KEY."
-            
+
         if not img_base64:
             return "No image data received."
-            
+
         try:
-             raw = img_base64.split(",")[1] if "," in img_base64 else img_base64
-             
-             data = base64.b64decode(raw, validate=True)
-             
-             if len(data) > 5 * 1024 * 1024:
-                  logger.warning("[VISION] Image too large. Please use a smaller image.")
-                  return "Image is too large. Please use a smaller image."
-                  
+            raw = img_base64.split(",")[1] if "," in img_base64 else img_base64
+
+            data = base64.b64decode(raw, validate=True)
+
+            if len(data) > 5 * 1024 * 1024:
+                logger.warning("[VISION] Image too large. Please use a smaller image.")
+                return "Image is too large. Please use a smaller image."
+
         except Exception as e:
-             logger.warning("[VISION] Invalid base64 image: %s", e)
-             return "Invalid image data. Please try again."
-             
+            logger.warning("[VISION] Invalid base64 image: %s", e)
+            return "Invalid image data. Please try again."
+
         mime = "image/jpeg"
         if raw.startswith("/9j/"):
-             mime = "image/jpeg"
+            mime = "image/jpeg"
         elif raw.startswith("iVBORw0KGgo"):
-             mime = "image/png"
+            mime = "image/png"
         elif raw.startswith("UklGR"):
-             mime = "image/webp"
-             
-        user_question = prompt or "What do you see in this image? Describe it in detail."
+            mime = "image/webp"
+
+        user_question = (
+            prompt or "What do you see in this image? Describe it in detail."
+        )
         user_question = user_question.strip()
-        
+
         data_url = f"data:{mime};base64,{raw}"
-        
+
         messages = [
-            {
-                "role": "system",
-                "content": VISION_SYSTEM_PROMPT
-            },
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": user_question
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": data_url
-                        }
-                    }
-                ]
-            }
+                    {"type": "text", "text": user_question},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
         ]
-        
+
         try:
-             response = self.groq_client.chat.completions.create(
-                 model=GROQ_VISION_MODEL,
-                 messages=messages,
-                 max_tokens=600,
-             )
-             
-             if response.choices:
-                 text = response.choices[0].message.content.strip()
-                 if text:
-                     return text
-                     
+            from groq import Groq
+
+            groq_client = Groq(api_key=api_key)
+            response = groq_client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=messages,
+                max_tokens=600,
+            )
+
+            if response.choices:
+                text = response.choices[0].message.content.strip()
+                if text:
+                    return text
+
         except Exception as e:
-             err_str = str(e).lower()
-             if "content_policy" in err_str or "safety" in err_str:
-                 logger.warning("[VISION] Groq content policy: %s", e)
-                 return "The image couldn't be analyzed due to content guidelines."
-                 
-             logger.warning("[VISION] Groq vision error: %s", e)
-             
+            err_str = str(e).lower()
+            if "content_policy" in err_str or "safety" in err_str:
+                logger.warning("[VISION] Groq content policy: %s", e)
+                return "The image couldn't be analyzed due to content guidelines."
+
+            logger.warning("[VISION] Groq vision error: %s", e)
+
         return None
