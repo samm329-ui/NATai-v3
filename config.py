@@ -18,6 +18,7 @@ CHATS_DATA_DIR.mkdir(parents=True, exist_ok=True)
 VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
 CAMERA_CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def _load_groq_api_keys() -> list:
     keys = []
 
@@ -38,23 +39,27 @@ def _load_groq_api_keys() -> list:
 
     return keys
 
+
 GROQ_API_KEYS = _load_groq_api_keys()
 GROQ_API_KEY = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
+GROQ_API_KEY_VISION = os.getenv("GROQ_API_KEY_VISION", GROQ_API_KEY)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 GROQ_BRAIN_MODEL = os.getenv("GROQ_BRAIN_MODEL", "llama-3.1-8b-instant")
 INTENT_CLASSIFY_MODEL = os.getenv("INTENT_CLASSIFY_MODEL", "llama-3.1-8b-instant")
 TASK_EXECUTION_TIMEOUT = int(os.getenv("TASK_EXECUTION_TIMEOUT", "30"))
-GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+GROQ_VISION_MODEL = os.getenv(
+    "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
 VISION_MAX_IMAGE_BYTES = int(os.getenv("VISION_MAX_IMAGE_BYTES", "5000000"))
-TTS_VOICE = os.getenv("TTS_VOICE", "en-GB-RyanNeural")
-TTS_RATE = os.getenv("TTS_RATE", "+22%")
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-JennyNeural")
+TTS_RATE = os.getenv("TTS_RATE", "+10%")
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 MAX_CHAT_HISTORY_TURNS = 10
 MAX_MESSAGE_LENGTH = 32_000
-ASSISTANT_NAME = (os.getenv("ASSISTANT_NAME", "").strip() or "Natasha")
+ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "").strip() or "Natasha"
 NATASHA_USER_TITLE = os.getenv("NATASHA_USER_TITLE", "").strip()
 NATASHA_OWNER_NAME = os.getenv("NATASHA_OWNER_NAME", "").strip()
 
@@ -92,17 +97,27 @@ State each fact ONCE. Never repeat the same point. "A, B, and C." — not "A and
 """
 
 
-_NATASHA_SYSTEM_PROMPT_BASE_FMT = _NATASHA_SYSTEM_PROMPT_BASE.format(assistant_name=ASSISTANT_NAME)
+_NATASHA_SYSTEM_PROMPT_BASE_FMT = _NATASHA_SYSTEM_PROMPT_BASE.format(
+    assistant_name=ASSISTANT_NAME
+)
 
 if NATASHA_USER_TITLE:
-    NATASHA_SYSTEM_PROMPT = _NATASHA_SYSTEM_PROMPT_BASE_FMT + f"\n- When appropriate, you may address the user as: {NATASHA_USER_TITLE}"
+    NATASHA_SYSTEM_PROMPT = (
+        _NATASHA_SYSTEM_PROMPT_BASE_FMT
+        + f"\n- When appropriate, you may address the user as: {NATASHA_USER_TITLE}"
+    )
 
 else:
     NATASHA_SYSTEM_PROMPT = _NATASHA_SYSTEM_PROMPT_BASE_FMT
 
 GENERAL_CHAT_ADDENDUM = """
 You are in GENERAL mode (no web search). Answer from your knowledge and the context provided (learning data, conversation history). Answer confidently and briefly. Never tell the user to search online or check a website — you are their source. Default to 1-2 sentences; only elaborate when the user asks for more or the question clearly needs it. If you have relevant context from the user's learning data, use it naturally without mentioning the source.
-"""
+
+=== IDENTITY ===
+- When asked "who are you?" or "what is your name?": Say "{assistant_name}" (the name given to you).
+- When asked about the user's name: Use the stored user title: {user_title}. If unknown, ask "What should I call you?"
+- Answer identity questions confidently and briefly.
+""".format(assistant_name=ASSISTANT_NAME, user_title=NATASHA_USER_TITLE or "the user")
 
 REALTIME_CHAT_ADDENDUM = """
 You are in REALTIME mode. Live web search results are above.
@@ -117,21 +132,27 @@ CRITICAL: Use search results as your PRIMARY source. Extract specific facts, nam
 LENGTH: 1-2 sentences for simple questions. Only longer when asked.
 """
 
+REALTIME_WEB_SEARCH_ADDENDUM = """
+You are in REALTIME mode with live web search results. Use them as your primary source.
+"""
+
+MAX_TOKENS_GROQ = 4096
+REQUEST_TIMEOUT_FAST = 10
+
+
 def load_user_context() -> str:
     context_parts = []
 
     text_files = sorted(LEARNING_DATA_DIR.glob("*.txt"))
 
     for file_path in text_files:
-
         try:
-
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
 
                 if content:
                     context_parts.append(content)
-                    
+
         except Exception as e:
             logger.warning("Could not load learning data file %s: %s", file_path, e)
 
