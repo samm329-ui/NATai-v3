@@ -408,6 +408,7 @@ def _stream_generator(
     is_first = True
     last_submit_time = time.perf_counter()
     buffer = ""
+    pending_sentence = ""
 
     def _submit(text):
         nonlocal last_submit_time
@@ -444,6 +445,20 @@ def _stream_generator(
         for ev in _drain_ready():
             yield ev
 
+    def _process_sentences_during_stream(text_chunk):
+        nonlocal buffer, pending_sentence
+        buffer += text_chunk
+
+        sentences = _split_sentences(buffer)
+
+        if len(sentences) > 1:
+            buffer = sentences[-1]
+            for sent in sentences[:-1]:
+                if sent and sent.strip():
+                    _submit(sent.strip())
+        else:
+            buffer = sentences[0] if sentences else ""
+
     try:
         for chunk in chunk_iter:
             if isinstance(chunk, dict) and "activity" in chunk:
@@ -475,7 +490,10 @@ def _stream_generator(
             if not isinstance(chunk, str):
                 continue
 
-            buffer += chunk
+            _process_sentences_during_stream(chunk)
+
+            for ev in _yield_completed_audio():
+                yield ev
 
     except Exception as e:
         logger.error("[STREAM] Error in generator: %s", e)
@@ -483,11 +501,10 @@ def _stream_generator(
         return
 
     if tts_enabled:
-        sentences = _split_sentences(buffer)
-        sentences = _merge_short(sentences)
-        for sent in sentences:
-            if sent and sent.strip():
-                _submit(sent.strip())
+        if buffer or pending_sentence:
+            final_text = (buffer + " " + pending_sentence).strip()
+            if final_text:
+                _submit(final_text)
 
         for fut in audio_queue:
             try:

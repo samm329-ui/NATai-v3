@@ -214,10 +214,10 @@ class ChatService:
                     merged.append((msg.get("content") or "", ""))
                 i += 1
 
-        if len(history) > MAX_CHAT_HISTORY_TURNS:
-            history = history[-MAX_CHAT_HISTORY_TURNS:]
+        if len(merged) > MAX_CHAT_HISTORY_TURNS:
+            merged = merged[-MAX_CHAT_HISTORY_TURNS:]
 
-        return history
+        return merged
 
     def process_message_sync(self, session_id: str, user_message: str) -> str:
         if not self.groq_service:
@@ -606,6 +606,21 @@ class ChatService:
 
                 with open(filepath, "w", encoding="utf-8") as f:
                     json.dump(chat_dict, f, indent=2, ensure_ascii=False)
+
+                if (
+                    self.vector_store
+                    and len(self.chat_sessions.get(session_id, [])) >= 2
+                ):
+                    messages = self.chat_sessions[session_id]
+                    user_msg = ""
+                    ai_msg = ""
+                    for msg in messages[-2:]:
+                        if msg.get("role") == "user":
+                            user_msg = msg.get("content", "")
+                        elif msg.get("role") == "assistant":
+                            ai_msg = msg.get("content", "")
+                    if user_msg or ai_msg:
+                        self.vector_store.add_chat_memory(session_id, user_msg, ai_msg)
 
                 if log_timing:
                     logger.info(

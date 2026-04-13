@@ -848,7 +848,7 @@ async function sendMessageWithImage(text, imgBase64) {
     const controller = new AbortController();
     try {
         timeoutId = setTimeout(() => controller.abort(), 300000);
-        const res = await fetch(`${API}/chat/natasha/stream`, {
+        const res = await fetch(`${API}${getEndpointForMode('natasha')}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1069,10 +1069,24 @@ function updatePanelOverlay() {
     panelOverlay.classList.toggle('visible', !!anyOpen);
 }
 
+function getEndpointForMode(mode) {
+    if (mode === 'realtime') return '/realtime/stream';
+    if (mode === 'general') return '/chat/stream';
+    return '/chat/natasha/stream';
+}
+
 function setMode(mode) {
     currentMode = mode || 'natasha';
-    if (btnNatasha) btnNatasha.classList.add('active');
-    if (modeSlider) modeSlider.classList.remove('center', 'right');
+    if (btnNatasha) {
+        const buttons = document.querySelectorAll('.mode-btn');
+        buttons.forEach(b => b.classList.remove('active'));
+        if (mode === 'natasha' && btnNatasha) btnNatasha.classList.add('active');
+    }
+    if (modeSlider) {
+        modeSlider.classList.remove('center', 'right');
+        if (mode === 'general') modeSlider.classList.add('center');
+        else if (mode === 'realtime') modeSlider.classList.add('right');
+    }
     if (activityToggle) activityToggle.style.display = '';
 }
 
@@ -1406,7 +1420,7 @@ async function sendMessage(textOverride) {
     if (orbContainer) orbContainer.classList.add('active');
     if (ttsPlayer) { ttsPlayer.reset(); ttsPlayer.unlock(); }
     const messageToSend = imgBase64 ? (text + ' ' + CAM_BYPASS_TOKEN) : text;
-    const endpoint = '/chat/natasha/stream';
+    const endpoint = getEndpointForMode(currentMode);
     if (activityList) {
         activityList.innerHTML = '<div class="activity-empty" id="activity-empty">Processing...</div>';
         if (activityToggle) activityToggle.style.display = '';
