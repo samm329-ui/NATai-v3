@@ -256,7 +256,12 @@ class GroqService:
         question: str,
         chat_history: Optional[List[Tuple]] = None,
         add_addendum: str = "",
+        mode: str = "general",
     ) -> Tuple[PromptTemplate, List]:
+
+        from app.config import VECTOR_TOP_K_GENERAL, VECTOR_TOP_K_THINKING
+
+        top_k = VECTOR_TOP_K_THINKING if mode == "thinking" else VECTOR_TOP_K_GENERAL
 
         context_docs = []
         context = ""
@@ -265,13 +270,22 @@ class GroqService:
         try:
             retriever = self.vector_store.get_retriever()
             if retriever:
-                context_docs = retriever.invoke(question)
+                context_docs = retriever.invoke(question)[:top_k]
 
-                context = "\n".join([doc.page_content for doc in context_docs])
-                context_sources = [
-                    doc.metadata.get("source", "unknown") for doc in context_docs
+                filtered_docs = [
+                    doc
+                    for doc in context_docs
+                    if doc.metadata.get("memory_type") != "realtime_ephemeral"
                 ]
-                logger.info("[CONTEXT] Retrieved relevant chunks for query")
+                context = "\n".join([doc.page_content for doc in filtered_docs])
+                context_sources = [
+                    doc.metadata.get("source", "unknown") for doc in filtered_docs
+                ]
+                logger.info(
+                    "[CONTEXT] Retrieved %d chunks (filtered to %d)",
+                    len(context_docs),
+                    len(filtered_docs),
+                )
 
         except Exception as e:
             logger.warning(
@@ -289,6 +303,15 @@ class GroqService:
         if context:
             extra_parts = escape_curly_braces(context)
             system_message += f"\n\nContext Information:\n{extra_parts}"
+
+        anti_repeat_prompt = """
+
+=== ANTI-REPETITION ===
+- Answer once, do not repeat the same point
+- Do not echo retrieval chunks verbatim
+- Use your own words to synthesize information
+"""
+        system_message += anti_repeat_prompt
 
         messages = []
         if chat_history:
