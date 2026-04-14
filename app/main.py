@@ -21,6 +21,7 @@ from app.models import ChatRequest, ChatResponse, TTSRequest
 
 from app.utils.retry import with_retry
 from app.utils.time_info import get_time_information
+from app.utils.key_rotation import get_next_key_pair
 
 RATE_LIMIT_MESSAGE = (
     "You've reached your daily API limit for this assistant. "
@@ -139,7 +140,7 @@ async def lifespan(app: FastAPI):
             "Realtime Groq service (with Tavily search...) initialized successfully"
         )
 
-        brain_service = BrainService(groq_service)
+        brain_service = BrainService(groq_service, vector_store_service)
         logger.info(
             "Brain service (Groq query classification...) initialized successfully"
         )
@@ -308,7 +309,7 @@ SPLIT_RE = re.compile(r"([.!?\n])\s+")
 MIN_WORDS_FIRST = 1
 MIN_WORDS = 1
 MERGE_IF_WORDS = 1
-TTS_BUFFER_TIMEOUT = 0.5
+TTS_BUFFER_TIMEOUT = 0.3
 ABBREV_HOLD_RE = re.compile(r"(?i)\b(?:mr|ms|mrs|dr|prof|st|jr|sr|inc|ltd|vs|etc)\.$")
 
 
@@ -569,7 +570,15 @@ async def chat_realtime(request: ChatRequest):
     try:
         session_id = chat_service.get_or_create_session(request.session_id)
 
-        response_text = chat_service.process_message_sync(session_id, request.message)
+        chat_history = chat_service.format_history_for_llm(
+            session_id, exclude_last=True
+        )
+        chat_idx, _ = get_next_key_pair(len(GROQ_API_KEYS), need_brain=False)
+        response_text = realtime_service.get_response(
+            request.message,
+            chat_history=chat_history,
+            key_start_index=chat_idx or 0,
+        )
 
         logger.info(
             "[API] /realtime response | session_id: %s, response_len=%d",
@@ -663,6 +672,46 @@ async def natasha_stream(request: ChatRequest):
             logger.warning("[API] Natasha stream rate limit hit: %s", e)
             raise HTTPException(status_code=429, detail=RATE_LIMIT_MESSAGE)
         logger.error("[API] /natasha/stream error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
+
+
+@app.post("/chat/thinking/stream")
+async def thinking_stream(request: ChatRequest):
+    if not chat_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    logger.info(
+        "[API] /chat/thinking/stream incoming | session_id: %s, message_len=%d",
+        request.session_id,
+        len(request.message),
+    )
+
+    try:
+        session_id = chat_service.get_or_create_session(request.session_id)
+
+        chunk_iter = chat_service.process_thinking_stream(
+            session_id=session_id,
+            user_message=request.message,
+            force_clarify=request.force_clarify,
+            clarification_choice=request.clarification_choice,
+        )
+
+        return StreamingResponse(
+            _stream_generator(
+                session_id, chunk_iter, is_realtime=False, tts_enabled=request.tts
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    except AllowableApiFailedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    except Exception as e:
+        if is_rate_limit_error(e):
+            logger.warning("[API] Thinking stream rate limit hit: %s", e)
+            raise HTTPException(status_code=429, detail=RATE_LIMIT_MESSAGE)
+        logger.error("[API] /chat/thinking/stream error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing chat: {str(e)}")
 
 
