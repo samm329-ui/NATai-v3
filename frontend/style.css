@@ -126,33 +126,23 @@ textarea {
     letter-spacing: 0.5px;
 }
 
-.mode-switch {
-    position: relative;
+.mode-single-btn {
     display: flex;
-    background: rgba(255, 255, 255, 0.04);
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text);
+    background: rgba(124, 106, 239, 0.15);
+    border: 1px solid var(--accent);
     border-radius: 12px;
-    padding: 3px;
-    gap: 2px;
+    cursor: pointer;
+    transition: all var(--transition);
 }
 
-.mode-slider {
-    position: absolute;
-    top: 3px;
-    left: 3px;
-    width: calc(50% - 4px);
-    height: calc(100% - 6px);
+.mode-single-btn:hover {
     background: var(--accent);
-    border-radius: 10px;
-    transition: transform var(--transition);
-    opacity: 0.18;
-}
-
-.mode-slider.right {
-    transform: translateX(calc(100% + 2px));
-}
-
-.mode-switch-single {
-    min-width: 0;
 }
 
 .mode-switch-single .mode-btn {
@@ -369,6 +359,47 @@ textarea {
     border-color: var(--accent);
     transform: translateY(-2px);
     box-shadow: 0 4px 12px rgba(124, 106, 239, 0.25);
+}
+
+.clarification-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 12px;
+}
+
+.clarification-question {
+    width: 100%;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+}
+
+.clarification-chip {
+    padding: 8px 16px;
+    font-size: 0.74rem;
+    background: rgba(124, 106, 239, 0.15);
+    border: 1px solid var(--accent);
+    color: var(--text);
+    border-radius: 16px;
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.clarification-chip:hover {
+    background: var(--accent);
+    transform: translateY(-1px);
+}
+
+.mode-btn.active {
+    color: var(--text);
+}
+
+.mode-btn.active .mode-btn-text {
+    font-weight: 600;
 }
 
 .message {
@@ -926,6 +957,19 @@ textarea {
     opacity: 0.5;
     cursor: default;
     box-shadow: none;
+}
+
+.think-btn.active {
+    background: #4ecdc4 !important;
+    border-color: #4ecdc4 !important;
+    color: #fff !important;
+    box-shadow: 0 0 12px rgba(78, 205, 196, 0.5);
+}
+
+.think-btn.active:hover {
+    background: #3db8af !important;
+    box-shadow: 0 0 16px rgba(78, 205, 196, 0.7);
+}
     transform: none;
     animation: sendBtnPulse 1.2s ease-in-out infinite;
 }

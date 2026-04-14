@@ -23,19 +23,14 @@
                 <span class="tagline">Neural AI Technology & Advanced System for Human Assistance</span>
             </div>
             <div class="header-center">
-                <div class="mode-switch mode-switch-single" id="mode-switch">
-                    <div class="mode-slider" id="mode-slider"></div>
-                    <button class="mode-btn active" data-mode="natasha" id="btn-natasha"
-                        title="Natasha — task execution, vision, chat">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                            stroke-width="2">
-                            <path d="M12 2L2 7l10 5 10-5-10-5z" />
-                            <path d="M2 17l10 5 10-5" />
-                            <path d="M2 12l10 5 10-5" />
-                        </svg>
-                        <span class="mode-btn-text">Natasha</span>
-                    </button>
-                </div>
+                <button class="mode-single-btn active" id="btn-natasha" title="Natasha">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                        <path d="M2 17l10 5 10-5" />
+                        <path d="M2 12l10 5 10-5" />
+                    </svg>
+                    <span>Natasha</span>
+                </button>
             </div>
             <div class="header-right">
                 <div class="status-badge" id="status-badge">
@@ -157,6 +152,13 @@
                             <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                             <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
                             <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                        </svg>
+                    </button>
+                    <button class="action-btn think-btn" id="think-btn" title="Thinking Mode - asks clarifying questions for vague requests">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+                            <line x1="12" y1="17" x2="12.01" y2="17"/>
                         </svg>
                     </button>
                     <button class="action-btn send-btn" id="send-btn" title="Send message">
