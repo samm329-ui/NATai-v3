@@ -1,8 +1,37 @@
 import logging
 import re
 import time
-from typing import List, Optional, Tuple, Literal
-from config import GROQ_API_KEYS, INTENT_CLASSIFY_MODEL
+from typing import List, Optional, Tuple, Literal, Dict
+from config import GROQ_API_KEYS, INTENT_CLASSIFY_MODEL, CLARIFICATION_THRESHOLD
+
+CLARIFY_SYSTEM_PROMPT = """You are a clarification assistant. When a user's request is vague, ambiguous, or has multiple possible interpretations, ask a clarifying question.
+
+=== WHEN TO ASK ===
+- Request is vague ("do that", "make it better", "the other one")
+- Multiple possible targets ("open the finance website" - which one?)
+- Missing key detail ("add to my list" - which list?)
+- Action could be wrong if guessed incorrectly
+
+=== OUTPUT FORMAT ===
+Respond with JSON:
+{
+  "needs_clarification": true/false,
+  "question": "Your clarifying question here",
+  "options": ["Option 1", "Option 2", ...],
+  "recommended_mode": "general" / "realtime" / "task"
+}
+
+=== EXAMPLES ===
+User: "Create a financial report"
+Response: {"needs_clarification": true, "question": "What type of financial report?", "options": ["Personal finance summary", "Company analysis", "Stock market report"], "recommended_mode": "task"}
+
+User: "Make it better"
+Response: {"needs_clarification": true, "question": "In what way should I improve it?", "options": ["Better wording", "More detail", "Shorter version", "More technical"], "recommended_mode": "general"}
+
+User: "Open Google"
+Response: {"needs_clarification": false, "question": "", "options": [], "recommended_mode": "task"}
+
+Respond with ONLY the JSON. No explanation."""
 
 logger = logging.getLogger("N.A.T.A.S.H.A")
 
@@ -10,15 +39,25 @@ CategoryType = Literal["general", "realtime", "camera", "task"]
 ALL_CATEGORIES: List[str] = ["general", "realtime", "camera", "task", "mixed"]
 
 TaskType = Literal[
-    "open", "play", "generate_image", "content",
-    "google_search", "youtube_search",
-    "open_webcam", "close_webcam",
+    "open",
+    "play",
+    "generate_image",
+    "content",
+    "google_search",
+    "youtube_search",
+    "open_webcam",
+    "close_webcam",
 ]
 
 ALL_TASK_TYPES: List[str] = [
-    "open", "play", "generate_image", "content",
-    "google_search", "youtube_search",
-    "open_webcam", "close_webcam",
+    "open",
+    "play",
+    "generate_image",
+    "content",
+    "google_search",
+    "youtube_search",
+    "open_webcam",
+    "close_webcam",
 ]
 
 MAX_CONTEXT_TURNS = 6
@@ -28,9 +67,16 @@ _PRIMARY_BRAIN_PROMPT = """You are the decision-maker for NATASHA. Classify the 
 
 === CATEGORIES ===
 
-**camera** — User wants to ANALYZE, IDENTIFY, or SEE something visual. They are holding, showing, or displaying something and want you to look at it.
-Examples: "What is this?" / "What am I holding?" / "What do you see?" / "Describe what I'm showing" / "Identify this" / "What's in my hand?" / "Look at this" / "Read this" / "Can you see this?" / "Check this out"
-- Any request where the user expects you to LOOK at something through the camera → camera
+**camera** — User wants to LOOK at or SEE something through the camera. They are physically showing or pointing something to you.
+Examples: "What is this?" / "What am I holding?" / "What do you see in this image?" / "Describe what I'm showing" / "Identify this" / "What's in my hand?" / "Look at this" / "Read this"
+- ONLY use camera when the user is explicitly showing or pointing something to the camera
+- "analyze" / "prediction" / "tell me about" / "information" → NOT camera, use realtime or general
+
+**task** — User wants ONLY an ACTION performed (no question to answer). Opening apps/websites, playing music/video, generating images, writing content, searching Google/YouTube, or controlling the webcam.
+Examples: "Open YouTube" / "Play despacito" / "Generate image of a cat" / "Write an essay about AI" / "Search for Python tutorials" / "Open webcam" / "Close webcam" / "Launch Netflix" / "Go to Facebook" / "Make me a picture of a sunset" / "Draw a cat" / "Create an image of mountains"
+- ANY request to open, launch, play, generate, draw, create, write, draft, compose, search, or control webcam → task
+- "Open webcam" / "Turn on camera" / "Close webcam" / "Turn off camera" → task
+- Image/picture/drawing requests → task (NOT camera)
 
 **task** — User wants ONLY an ACTION performed (no question to answer). Opening apps/websites, playing music/video, generating images, writing content, searching Google/YouTube, or controlling the webcam.
 Examples: "Open YouTube" / "Play despacito" / "Generate image of a cat" / "Write an essay about AI" / "Search for Python tutorials" / "Open webcam" / "Close webcam" / "Launch Netflix" / "Go to Facebook" / "Make me a picture of a sunset" / "Draw a cat" / "Create an image of mountains"
@@ -49,6 +95,8 @@ Examples: "What is machine learning? Also generate an image of a neural network"
 Examples: "Who is Elon Musk?" / "Latest news" / "What's the weather?" / "Current stock price" / "Today's headlines" / "Tell me about [famous person]" / "What happened in [event]?" / "How much does X cost?" / "Reviews of X" / "Best restaurants near me"
 - Questions about PEOPLE (who is, tell me about), EVENTS (what happened), PRICES, REVIEWS, NEWS → realtime
 - Questions about anything that changes over time or needs up-to-date info → realtime
+- "weather" / "temperature" / "forecast" → realtime
+- "Pakistan" / "India" / "war" / "attack" / "military" / "politics" / "prediction" → realtime (needs current info)
 - When unsure if your knowledge is current enough → realtime (PREFER realtime over general for factual questions)
 
 **general** — Chat from knowledge only. No web search needed. ONLY for: greetings, casual chat, opinions, advice, coding help, math, static facts, personal questions about the user's stored data.
@@ -160,16 +208,19 @@ When the user is correcting a previous task, use conversation history to underst
 *** "Draw/Generate/Create [image description]" → generate_image (keep full visual description) ***
 *** Output ONLY the structured response. No explanation. No extra text. ***"""
 
-class BrainService:
 
-    def __init__(self, groq_service=None):
+class BrainService:
+    def __init__(self, groq_service=None, vector_store=None):
         self.groq_service = groq_service
+        self.vector_store = vector_store
         self._llms = []
         self._last_task_decisions = []
+        self._clarify_llm = None
 
         if GROQ_API_KEYS:
             try:
                 from langchain_groq import ChatGroq
+
                 self._llms = [
                     ChatGroq(
                         groq_api_key=key,
@@ -181,12 +232,15 @@ class BrainService:
                     for key in GROQ_API_KEYS
                 ]
 
-                logger.info("[BRAIN] Two-stage decision model initialized (%s) with %d key(s)",
-                            INTENT_CLASSIFY_MODEL, len(self._llms))
-                
+                logger.info(
+                    "[BRAIN] Two-stage decision model initialized (%s) with %d key(s)",
+                    INTENT_CLASSIFY_MODEL,
+                    len(self._llms),
+                )
+
             except Exception as e:
                 logger.warning("[BRAIN] Failed to create Groq: %s", e)
-                
+
         if not self._llms and not groq_service:
             logger.warning("[BRAIN] No Groq. Will use rule-based fallback.")
 
@@ -208,25 +262,52 @@ class BrainService:
         )
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info("[BRAIN-PRIMARY] %s -> %s (%d ms, %s)", msg[:50], category, elapsed_ms, method)
+        logger.info(
+            "[BRAIN-PRIMARY] %s -> %s (%d ms, %s)",
+            msg[:50],
+            category,
+            elapsed_ms,
+            method,
+        )
         return (category, method, elapsed_ms)
 
     _TASK_FEW_SHOTS = [
         ("how are you?", "general how are you?"),
-        ("open chrome and tell me about mahatma gandhi.", "open chrome, general tell me about mahatma gandhi"),
+        (
+            "open chrome and tell me about mahatma gandhi.",
+            "open chrome, general tell me about mahatma gandhi",
+        ),
         ("open chrome and firefox", "open chrome, open firefox"),
         ("play Dhurandhar title track on YouTube", "play Dhurandhar title track"),
         ("hello Natasha can you play Shape of You", "play Shape of You"),
-        ("hey Natasha Teja song Dhurandhar title track can you play that on YouTube", "play Teja Dhurandhar title track"),
-        ("can you open the website Natasha for everyone", "open natashaforeveryone.com"),
-        ("draw me a beautiful sunset over the ocean", "generate_image beautiful sunset over the ocean"),
-        ("can you make a picture of a dragon breathing fire", "generate_image dragon breathing fire"),
-        ("create an image of a futuristic city at night", "generate_image futuristic city at night"),
+        (
+            "hey Natasha Teja song Dhurandhar title track can you play that on YouTube",
+            "play Teja Dhurandhar title track",
+        ),
+        (
+            "can you open the website Natasha for everyone",
+            "open natashaforeveryone.com",
+        ),
+        (
+            "draw me a beautiful sunset over the ocean",
+            "generate_image beautiful sunset over the ocean",
+        ),
+        (
+            "can you make a picture of a dragon breathing fire",
+            "generate_image dragon breathing fire",
+        ),
+        (
+            "create an image of a futuristic city at night",
+            "generate_image futuristic city at night",
+        ),
         ("write me a poem about the stars", "content poem about the stars"),
         ("open webcam", "open_webcam"),
         ("turn off the camera", "close_webcam"),
         ("play some lo-fi beats", "play lo-fi beats"),
-        ("open YouTube and play Arijit Singh songs", "open youtube, play Arijit Singh songs"),
+        (
+            "open YouTube and play Arijit Singh songs",
+            "open youtube, play Arijit Singh songs",
+        ),
     ]
 
     def classify_task(
@@ -241,13 +322,31 @@ class BrainService:
             return (["open"], "empty", 0)
 
         m_lower = msg.lower()
-        if any(x in m_lower for x in ["open webcam", "turn on camera", "start camera",
-                                        "open the webcam", "start the camera", "turn on the camera"]):
+        if any(
+            x in m_lower
+            for x in [
+                "open webcam",
+                "turn on camera",
+                "start camera",
+                "open the webcam",
+                "start the camera",
+                "turn on the camera",
+            ]
+        ):
             self._last_task_decisions = [("open_webcam", "")]
             return (["open_webcam"], "rule-fast", 0)
-        
-        if any(x in m_lower for x in ["close webcam", "turn off camera", "stop camera",
-                                        "close the webcam", "stop the camera", "turn off the camera"]):
+
+        if any(
+            x in m_lower
+            for x in [
+                "close webcam",
+                "turn off camera",
+                "stop camera",
+                "close the webcam",
+                "stop the camera",
+                "turn off the camera",
+            ]
+        ):
             self._last_task_decisions = [("close_webcam", "")]
             return (["close_webcam"], "rule-fast", 0)
 
@@ -255,25 +354,34 @@ class BrainService:
 
         if chat_history:
             for u, a in chat_history[-MAX_CONTEXT_TURNS:]:
-                u_preview = (u or "")[:MAX_MESSAGE_PREVIEW] + ("…" if len(u or "") > MAX_MESSAGE_PREVIEW else "")
-                a_preview = (a or "")[:MAX_MESSAGE_PREVIEW] + ("…" if len(a or "") > MAX_MESSAGE_PREVIEW else "")
+                u_preview = (u or "")[:MAX_MESSAGE_PREVIEW] + (
+                    "…" if len(u or "") > MAX_MESSAGE_PREVIEW else ""
+                )
+                a_preview = (a or "")[:MAX_MESSAGE_PREVIEW] + (
+                    "…" if len(a or "") > MAX_MESSAGE_PREVIEW else ""
+                )
                 context_lines.append(f"User: {u_preview}")
                 context_lines.append(f"Assistant: {a_preview}")
 
         context_block = "\n".join(context_lines) if context_lines else ""
-        context_section = f"Recent conversation:\n{context_block}\n\n" if context_block else ""
+        context_section = (
+            f"Recent conversation:\n{context_block}\n\n" if context_block else ""
+        )
         user_content = f"{context_section}User: {msg[:MAX_MESSAGE_PREVIEW]}"
         t0 = time.perf_counter()
 
         raw_response, method = self._run_llm_structured(
-            _TASK_BRAIN_PROMPT, user_content, key_index)
+            _TASK_BRAIN_PROMPT, user_content, key_index
+        )
 
         decisions = self._parse_task_decisions(raw_response)
         self._last_task_decisions = decisions
         task_types = [d[0] for d in decisions]
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info("[BRAIN-TASK] %s -> %s (%d ms, %s)", msg[:50], decisions, elapsed_ms, method)
+        logger.info(
+            "[BRAIN-TASK] %s -> %s (%d ms, %s)", msg[:50], decisions, elapsed_ms, method
+        )
         return (task_types, method, elapsed_ms)
 
     def classify(
@@ -282,22 +390,28 @@ class BrainService:
         chat_history: Optional[List[Tuple[str, str]]] = None,
         key_index: int = 0,
     ) -> Tuple[str, List[str], str, int]:
-        category, method1, ms1 = self.classify_primary(user_message, chat_history, key_index)
+        category, method1, ms1 = self.classify_primary(
+            user_message, chat_history, key_index
+        )
 
         if category == "task":
-            task_types, method2, ms2 = self.classify_task(user_message, chat_history, key_index)
+            task_types, method2, ms2 = self.classify_task(
+                user_message, chat_history, key_index
+            )
             combined_method = f"{method1}+{method2}"
             return (category, task_types, combined_method, ms1 + ms2)
 
         return (category, [], method1, ms1)
 
     def extract_task_payloads(
-        self, user_message: str, task_types: List[str],
+        self,
+        user_message: str,
+        task_types: List[str],
         chat_history: Optional[List[Tuple[str, str]]] = None,
     ) -> List[Tuple[str, dict]]:
         from app.services.decision_types import ROUTE_TO_INTENT, INTENT_OPEN
 
-        decisions = getattr(self, '_last_task_decisions', [])
+        decisions = getattr(self, "_last_task_decisions", [])
 
         intents = []
 
@@ -307,7 +421,11 @@ class BrainService:
                 payload = {"message": user_message, "raw": user_message}
 
                 if task_type == "open":
-                    url = self._resolve_open_query(clean_query) if clean_query else "https://www.google.com"
+                    url = (
+                        self._resolve_open_query(clean_query)
+                        if clean_query
+                        else "https://www.google.com"
+                    )
                     payload["url"] = url
                 elif task_type == "play":
                     payload["query"] = clean_query or user_message
@@ -350,17 +468,35 @@ class BrainService:
 
         return f"https://www.{q}.com"
 
-    def _resolve_correction(self, msg: str, chat_history: Optional[List[Tuple[str, str]]] = None) -> str:
+    def _resolve_correction(
+        self, msg: str, chat_history: Optional[List[Tuple[str, str]]] = None
+    ) -> str:
 
         if not chat_history:
             return msg
 
         m_lower = msg.lower().strip()
-        correction_signals = ["not that", "no i said", "no, i said", "i meant", "it's not", "its not",
-                              "that's wrong", "thats wrong", "not f-o-r", "not for ",
-                              "the other", "try again", "do that again", "one more time",
-                              "no no", "wrong one", "instead", "i didn't say"]
-        
+        correction_signals = [
+            "not that",
+            "no i said",
+            "no, i said",
+            "i meant",
+            "it's not",
+            "its not",
+            "that's wrong",
+            "thats wrong",
+            "not f-o-r",
+            "not for ",
+            "the other",
+            "try again",
+            "do that again",
+            "one more time",
+            "no no",
+            "wrong one",
+            "instead",
+            "i didn't say",
+        ]
+
         is_correction = any(sig in m_lower for sig in correction_signals)
 
         if not is_correction:
@@ -372,42 +508,86 @@ class BrainService:
             if any(sig in u_lower for sig in correction_signals):
                 continue
 
-            if any(p in u_lower for p in ["open ", "play ", "search ", "generate ", "write ", "launch ", "go to "]):
-                logger.info("[BRAIN] Correction detected. Original: '%s' | Correction: '%s'", u[:80], msg[:80])
+            if any(
+                p in u_lower
+                for p in [
+                    "open ",
+                    "play ",
+                    "search ",
+                    "generate ",
+                    "write ",
+                    "launch ",
+                    "go to ",
+                ]
+            ):
+                logger.info(
+                    "[BRAIN] Correction detected. Original: '%s' | Correction: '%s'",
+                    u[:80],
+                    msg[:80],
+                )
 
                 import re
-                domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z]{2,})+)', msg)
+
+                domain_match = re.search(
+                    r"([a-zA-Z0-9][-a-zA-Z0-9]*(?:\.[a-zA-Z]{2,})+)", msg
+                )
 
                 if domain_match:
                     new_domain = domain_match.group(1)
                     return f"open {new_domain}"
 
                 return f"{u} (correction: {msg})"
-            
+
             break
 
         return msg
 
-    def _build_context(self, msg: str, chat_history: Optional[List[Tuple[str, str]]] = None) -> str:
+    def _build_context(
+        self, msg: str, chat_history: Optional[List[Tuple[str, str]]] = None
+    ) -> str:
 
         context_lines = []
 
         if chat_history:
             for u, a in chat_history[-MAX_CONTEXT_TURNS:]:
-                u_preview = (u or "")[:MAX_MESSAGE_PREVIEW] + ("…" if len(u or "") > MAX_MESSAGE_PREVIEW else "")
-                a_preview = (a or "")[:MAX_MESSAGE_PREVIEW] + ("…" if len(a or "") > MAX_MESSAGE_PREVIEW else "")
+                u_preview = (u or "")[:MAX_MESSAGE_PREVIEW] + (
+                    "…" if len(u or "") > MAX_MESSAGE_PREVIEW else ""
+                )
+                a_preview = (a or "")[:MAX_MESSAGE_PREVIEW] + (
+                    "…" if len(a or "") > MAX_MESSAGE_PREVIEW else ""
+                )
                 context_lines.append(f"User: {u_preview}")
                 context_lines.append(f"Assistant: {a_preview}")
-        context_block = "\n".join(context_lines) if context_lines else "(No prior conversation)"
+        context_block = (
+            "\n".join(context_lines) if context_lines else "(No prior conversation)"
+        )
         msg_preview = msg[:MAX_MESSAGE_PREVIEW]
 
         correction_hint = ""
         m_lower = msg.lower().strip()
-        correction_signals = ["not that", "no i said", "no, i said", "i meant", "it's not", "its not",
-                              "that's wrong", "thats wrong", "i said", "not f-o-r", "not for",
-                              "the other", "try again", "do that again", "one more time",
-                              "no no", "wrong one", "instead", "i didn't say", "not what i"]
-        
+        correction_signals = [
+            "not that",
+            "no i said",
+            "no, i said",
+            "i meant",
+            "it's not",
+            "its not",
+            "that's wrong",
+            "thats wrong",
+            "i said",
+            "not f-o-r",
+            "not for",
+            "the other",
+            "try again",
+            "do that again",
+            "one more time",
+            "no no",
+            "wrong one",
+            "instead",
+            "i didn't say",
+            "not what i",
+        ]
+
         if any(sig in m_lower for sig in correction_signals):
             correction_hint = "\n\nNOTE: This message appears to be a CORRECTION or CLARIFICATION of a previous request. Check the conversation history to determine what the user originally asked for, and classify this message as the SAME category as that original request."
 
@@ -419,52 +599,73 @@ Current user message: {msg_preview}{correction_hint}
 Classify. Output EXACTLY ONE category name."""
 
     def _run_llm(
-        self, system_prompt: str, user_content: str, key_index: int,
-        valid_options: List[str], default: str
+        self,
+        system_prompt: str,
+        user_content: str,
+        key_index: int,
+        valid_options: List[str],
+        default: str,
     ) -> Tuple[str, str]:
-        
+
         if self._llms:
             try:
                 from langchain_core.messages import SystemMessage, HumanMessage
+
                 idx = key_index % len(self._llms)
                 llm = self._llms[idx]
-                response = llm.invoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=user_content),
-                ])
+                response = llm.invoke(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=user_content),
+                    ]
+                )
                 text = (response.content or "").strip().lower()
                 result = self._parse_single(text, valid_options, default)
                 return (result, "llm")
-            
+
             except Exception as e:
                 logger.warning("[BRAIN] LLM failed: %s. Using rule-based.", e)
 
-        msg = user_content.split("Current user message:")[-1].strip()[:500] if "Current user message:" in user_content else user_content[:500]
+        msg = (
+            user_content.split("Current user message:")[-1].strip()[:500]
+            if "Current user message:" in user_content
+            else user_content[:500]
+        )
         result = self._rule_based_primary(msg)
         return (result, "rule-based")
 
     def _run_llm_multi(
-        self, system_prompt: str, user_content: str, key_index: int,
-        valid_options: List[str]
+        self,
+        system_prompt: str,
+        user_content: str,
+        key_index: int,
+        valid_options: List[str],
     ) -> Tuple[List[str], str]:
-        
+
         if self._llms:
             try:
                 from langchain_core.messages import SystemMessage, HumanMessage
+
                 idx = key_index % len(self._llms)
                 llm = self._llms[idx]
-                response = llm.invoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=user_content),
-                ])
+                response = llm.invoke(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=user_content),
+                    ]
+                )
                 text = (response.content or "").strip().lower()
                 results = self._parse_multi(text, valid_options)
                 return (results, "llm")
-            
+
             except Exception as e:
                 logger.warning("[BRAIN-TASK] LLM failed: %s. Using rule-based.", e)
 
-        msg = user_content.split("User task request:")[-1].strip()[:500] if "User task request:" in user_content else user_content[:500]
+        msg = (
+            user_content.split("User task request:")[-1].strip()[:500]
+            if "User task request:" in user_content
+            else user_content[:500]
+        )
         results = self._rule_based_task(msg)
         return (results, "rule-based")
 
@@ -472,7 +673,7 @@ Classify. Output EXACTLY ONE category name."""
 
         if not text:
             return default
-        
+
         text = text.strip().lower()
 
         for opt in valid_options:
@@ -488,7 +689,7 @@ Classify. Output EXACTLY ONE category name."""
 
         if not text:
             return ["open"]
-        
+
         results = []
         seen = set()
 
@@ -499,7 +700,6 @@ Classify. Output EXACTLY ONE category name."""
                 continue
 
             for valid in valid_options:
-
                 if valid == r or valid in r:
                     if valid not in seen:
                         results.append(valid)
@@ -509,9 +709,12 @@ Classify. Output EXACTLY ONE category name."""
         return results if results else ["open"]
 
     def _run_llm_structured(
-        self, system_prompt: str, user_content: str, key_index: int,
+        self,
+        system_prompt: str,
+        user_content: str,
+        key_index: int,
     ) -> Tuple[str, str]:
-        
+
         from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
         few_shot_msgs = []
@@ -519,21 +722,30 @@ Classify. Output EXACTLY ONE category name."""
             few_shot_msgs.append(HumanMessage(content=f"User: {user_ex}"))
             few_shot_msgs.append(AIMessage(content=ai_ex))
 
-        messages = [SystemMessage(content=system_prompt)] + few_shot_msgs + [HumanMessage(content=user_content)]
+        messages = (
+            [SystemMessage(content=system_prompt)]
+            + few_shot_msgs
+            + [HumanMessage(content=user_content)]
+        )
 
         if self._llms:
-
             try:
                 idx = key_index % len(self._llms)
                 llm = self._llms[idx]
                 response = llm.invoke(messages)
                 text = (response.content or "").strip()
                 return (text, "llm")
-            
-            except Exception as e:
-                logger.warning("[BRAIN-TASK] Structured LLM failed: %s. Using rule-based.", e)
 
-        msg = user_content.split("User:")[-1].strip()[:500] if "User:" in user_content else user_content[:500]
+            except Exception as e:
+                logger.warning(
+                    "[BRAIN-TASK] Structured LLM failed: %s. Using rule-based.", e
+                )
+
+        msg = (
+            user_content.split("User:")[-1].strip()[:500]
+            if "User:" in user_content
+            else user_content[:500]
+        )
         results = self._rule_based_task(msg)
         fallback = ", ".join(results)
         return (fallback, "rule-based")
@@ -546,12 +758,20 @@ Classify. Output EXACTLY ONE category name."""
         text = raw_response.replace("\n", ",").strip()
 
         TASK_PREFIXES = [
-            "generate_image", "generate image",
-            "google_search", "google search",
-            "youtube_search", "youtube search",
-            "open_webcam", "close_webcam",
-            "content", "open", "close", "play",
-            "general", "realtime",
+            "generate_image",
+            "generate image",
+            "google_search",
+            "google search",
+            "youtube_search",
+            "youtube search",
+            "open_webcam",
+            "close_webcam",
+            "content",
+            "open",
+            "close",
+            "play",
+            "general",
+            "realtime",
         ]
 
         NORMALIZE = {
@@ -570,7 +790,7 @@ Classify. Output EXACTLY ONE category name."""
 
             for prefix in TASK_PREFIXES:
                 if part_lower.startswith(prefix):
-                    query = part[len(prefix):].strip().rstrip(".!?")
+                    query = part[len(prefix) :].strip().rstrip(".!?")
                     task_type = NORMALIZE.get(prefix, prefix)
 
                     if task_type in ("general", "realtime"):
@@ -583,7 +803,7 @@ Classify. Output EXACTLY ONE category name."""
                 for prefix in TASK_PREFIXES:
                     if prefix in part_lower:
                         idx = part_lower.index(prefix)
-                        query = part[idx + len(prefix):].strip().rstrip(".!?")
+                        query = part[idx + len(prefix) :].strip().rstrip(".!?")
                         task_type = NORMALIZE.get(prefix, prefix)
                         if task_type in ("general", "realtime"):
                             continue
@@ -592,48 +812,144 @@ Classify. Output EXACTLY ONE category name."""
                         break
 
                 if not matched:
-                    logger.warning("[BRAIN-TASK] Could not parse decision part: '%s'", part[:80])
+                    logger.warning(
+                        "[BRAIN-TASK] Could not parse decision part: '%s'", part[:80]
+                    )
 
         return decisions if decisions else [("open", "")]
 
     def _rule_based_primary(self, msg: str) -> str:
         m = (msg or "").strip().lower()
 
-        if any(x in m for x in ["do you know my", "link of my website", "my website link", "what's my website", "know the link of my"]):
+        if any(
+            x in m
+            for x in [
+                "do you know my",
+                "link of my website",
+                "my website link",
+                "what's my website",
+                "know the link of my",
+            ]
+        ):
             return "general"
 
-        if m in ("hello", "hi", "hey", "good morning", "good evening", "good afternoon",
-                 "how are you", "what's up", "thanks", "thank you", "bye", "goodbye"):
+        if m in (
+            "hello",
+            "hi",
+            "hey",
+            "good morning",
+            "good evening",
+            "good afternoon",
+            "how are you",
+            "what's up",
+            "thanks",
+            "thank you",
+            "bye",
+            "goodbye",
+        ):
             return "general"
 
-        if any(x in m for x in ["what do you see", "what can you see", "what am i holding",
-                                  "what is this", "describe this", "identify this",
-                                  "what's in my hand", "look at this", "read this",
-                                  "can you see", "check this out", "show you"]):
+        if any(
+            x in m
+            for x in [
+                "what do you see",
+                "what can you see",
+                "what am i holding",
+                "what is this",
+                "describe this",
+                "identify this",
+                "what's in my hand",
+                "look at this",
+                "read this",
+                "can you see",
+                "check this out",
+                "show you",
+            ]
+        ):
             return "camera"
 
-        if any(x in m for x in ["open webcam", "turn on camera", "start camera",
-                                  "close webcam", "turn off camera", "stop camera"]):
+        if any(
+            x in m
+            for x in [
+                "open webcam",
+                "turn on camera",
+                "start camera",
+                "close webcam",
+                "turn off camera",
+                "stop camera",
+            ]
+        ):
             return "task"
 
         task_patterns = [
-            "open ", "launch ", "go to ", "visit ",
-            "play ", "play the ", "play some ", "put on ",
-            "generate image", "generate an image", "draw ", "create image", "create an image",
-            "make me a picture", "make a picture", "picture of ", "image of ",
-            "write ", "draft ", "compose ", "essay", "poem", "letter",
-            "search for ", "look up ", "find me ", "google ",
-            "search youtube", "find videos",
+            "open ",
+            "launch ",
+            "go to ",
+            "visit ",
+            "play ",
+            "play the ",
+            "play some ",
+            "put on ",
+            "generate image",
+            "generate an image",
+            "draw ",
+            "create image",
+            "create an image",
+            "make me a picture",
+            "make a picture",
+            "picture of ",
+            "image of ",
+            "write ",
+            "draft ",
+            "compose ",
+            "essay",
+            "poem",
+            "letter",
+            "search for ",
+            "look up ",
+            "find me ",
+            "google ",
+            "search youtube",
+            "find videos",
         ]
 
         if any(m.startswith(p) or p in m for p in task_patterns):
             return "task"
 
-        if any(x in m for x in ["who is ", "who are ", "latest", "current", "news", "weather", "today",
-                                  "recent", "stock price", "trending", "score", "tell me about ",
-                                  "what happened", "how much does", "price of", "cost of",
-                                  "reviews of", "best restaurants"]):
+        if any(
+            x in m
+            for x in [
+                "who is ",
+                "who are ",
+                "latest",
+                "current",
+                "news",
+                "weather",
+                "today",
+                "recent",
+                "stock price",
+                "trending",
+                "score",
+                "tell me about ",
+                "what happened",
+                "how much does",
+                "price of",
+                "cost of",
+                "reviews of",
+                "best restaurants",
+            ]
+        ):
             return "realtime"
+
+        if self.vector_store:
+            try:
+                retriever = self.vector_store.get_retriever()
+                if retriever:
+                    docs = retriever.invoke(msg)
+                    if not docs or len(docs) == 0:
+                        return "realtime"
+            except:
+                return "realtime"
 
         return "general"
 
@@ -642,47 +958,116 @@ Classify. Output EXACTLY ONE category name."""
         m = (msg or "").strip().lower()
         tasks = []
 
-        if any(x in m for x in ["open webcam", "turn on camera", "start camera", "show me the camera",
-                                  "open the webcam", "start the camera", "turn on the camera"]):
+        if any(
+            x in m
+            for x in [
+                "open webcam",
+                "turn on camera",
+                "start camera",
+                "show me the camera",
+                "open the webcam",
+                "start the camera",
+                "turn on the camera",
+            ]
+        ):
             return ["open_webcam"]
-        if any(x in m for x in ["close webcam", "turn off camera", "stop camera",
-                                  "close the webcam", "stop the camera", "turn off the camera"]):
+        if any(
+            x in m
+            for x in [
+                "close webcam",
+                "turn off camera",
+                "stop camera",
+                "close the webcam",
+                "stop the camera",
+                "turn off the camera",
+            ]
+        ):
             return ["close_webcam"]
 
-        if m.startswith(("open ", "launch ", "go to ", "visit ", "can you open ")) or \
-           ("open" in m and any(s in m for s in ["facebook", "youtube", "google", "netflix", "gmail", "instagram", "twitter", "linkedin"])):
+        if m.startswith(("open ", "launch ", "go to ", "visit ", "can you open ")) or (
+            "open" in m
+            and any(
+                s in m
+                for s in [
+                    "facebook",
+                    "youtube",
+                    "google",
+                    "netflix",
+                    "gmail",
+                    "instagram",
+                    "twitter",
+                    "linkedin",
+                ]
+            )
+        ):
             tasks.append("open")
 
         if m.startswith(("play ", "play the ", "play some ")) or " play " in m:
             tasks.append("play")
 
-        if any(x in m for x in ["generate image", "draw ", "create image", "make me ", "picture of ", "image of "]):
+        if any(
+            x in m
+            for x in [
+                "generate image",
+                "draw ",
+                "create image",
+                "make me ",
+                "picture of ",
+                "image of ",
+            ]
+        ):
             tasks.append("generate_image")
 
-        if any(x in m for x in ["write ", "draft ", "compose ", "essay", "poem", "letter", "application "]):
+        if any(
+            x in m
+            for x in [
+                "write ",
+                "draft ",
+                "compose ",
+                "essay",
+                "poem",
+                "letter",
+                "application ",
+            ]
+        ):
             tasks.append("content")
 
         if "youtube" in m and any(x in m for x in ["search", "find"]):
             tasks.append("youtube_search")
 
-        if any(x in m for x in ["search for ", "look up ", "find me ", "google "]) and "youtube" not in m:
+        if (
+            any(x in m for x in ["search for ", "look up ", "find me ", "google "])
+            and "youtube" not in m
+        ):
             tasks.append("google_search")
 
         return tasks if tasks else ["open"]
 
     SITE_MAP = {
-        "facebook": "https://www.facebook.com", "instagram": "https://www.instagram.com",
-        "youtube": "https://www.youtube.com", "google": "https://www.google.com",
-        "netflix": "https://www.netflix.com", "twitter": "https://twitter.com",
-        "x.com": "https://x.com", "gmail": "https://mail.google.com",
-        "whatsapp": "https://web.whatsapp.com", "linkedin": "https://www.linkedin.com",
-        "reddit": "https://www.reddit.com", "discord": "https://discord.com/app",
-        "spotify": "https://open.spotify.com", "tiktok": "https://www.tiktok.com",
-        "amazon": "https://www.amazon.com", "github": "https://github.com",
-        "wikipedia": "https://www.wikipedia.org", "stackoverflow": "https://stackoverflow.com",
-        "medium": "https://medium.com", "notion": "https://www.notion.so",
-        "figma": "https://www.figma.com", "canva": "https://www.canva.com",
-        "zoom": "https://zoom.us", "drive": "https://drive.google.com",
+        "facebook": "https://www.facebook.com",
+        "instagram": "https://www.instagram.com",
+        "youtube": "https://www.youtube.com",
+        "google": "https://www.google.com",
+        "netflix": "https://www.netflix.com",
+        "twitter": "https://twitter.com",
+        "x.com": "https://x.com",
+        "gmail": "https://mail.google.com",
+        "whatsapp": "https://web.whatsapp.com",
+        "linkedin": "https://www.linkedin.com",
+        "reddit": "https://www.reddit.com",
+        "discord": "https://discord.com/app",
+        "spotify": "https://open.spotify.com",
+        "tiktok": "https://www.tiktok.com",
+        "amazon": "https://www.amazon.com",
+        "github": "https://github.com",
+        "wikipedia": "https://www.wikipedia.org",
+        "stackoverflow": "https://stackoverflow.com",
+        "medium": "https://medium.com",
+        "notion": "https://www.notion.so",
+        "figma": "https://www.figma.com",
+        "canva": "https://www.canva.com",
+        "zoom": "https://zoom.us",
+        "drive": "https://drive.google.com",
         "maps": "https://www.google.com/maps",
         "natasha for everyone": "https://natashaforeveryone.com",
         "natashaforeveryone": "https://natashaforeveryone.com",
@@ -696,22 +1081,29 @@ Classify. Output EXACTLY ONE category name."""
         cleaned = msg.strip()
 
         cleaned = re.sub(
-            r'^(?:hello|hi|hey|yo|hiya|howdy|ok|okay|alright)\s+(?:natasha|n\.?a\.?t\.?a\.?s\.?h\.?a\.?)\s*[,.]?\s*',
-            '', cleaned, flags=re.I
+            r"^(?:hello|hi|hey|yo|hiya|howdy|ok|okay|alright)\s+(?:natasha|n\.?a\.?t\.?a\.?s\.?h\.?a\.?)\s*[,.]?\s*",
+            "",
+            cleaned,
+            flags=re.I,
         ).strip()
 
         cleaned = re.sub(
-            r'^(?:hello|hi|hey|yo|hiya|howdy)\s*[,.]?\s*',
-            '', cleaned, flags=re.I
+            r"^(?:hello|hi|hey|yo|hiya|howdy)\s*[,.]?\s*", "", cleaned, flags=re.I
         ).strip()
 
         cleaned = re.sub(
-            r'^(?:natasha|n\.?a\.?t\.?a\.?s\.?h\.?a\.?)\s*[,.]?\s*',
-            '', cleaned, flags=re.I
+            r"^(?:natasha|n\.?a\.?t\.?a\.?s\.?h\.?a\.?)\s*[,.]?\s*",
+            "",
+            cleaned,
+            flags=re.I,
         ).strip()
 
-        cleaned = re.sub(r'\s+(?:please|pls|plz)\s*[.!?]*$', '', cleaned, flags=re.I).strip()
-        cleaned = re.sub(r'\s+(?:for me|right now|now|asap)\s*[.!?]*$', '', cleaned, flags=re.I).strip()
+        cleaned = re.sub(
+            r"\s+(?:please|pls|plz)\s*[.!?]*$", "", cleaned, flags=re.I
+        ).strip()
+        cleaned = re.sub(
+            r"\s+(?:for me|right now|now|asap)\s*[.!?]*$", "", cleaned, flags=re.I
+        ).strip()
         return cleaned if cleaned else msg.strip()
 
     def _extract_payload(self, task_type: str, message: str):
@@ -720,13 +1112,17 @@ Classify. Output EXACTLY ONE category name."""
             urls = self._extract_urls(message)
 
             if len(urls) <= 1:
-                return {"message": message, "raw": message, "url": urls[0] if urls else "https://www.google.com"}
-            
+                return {
+                    "message": message,
+                    "raw": message,
+                    "url": urls[0] if urls else "https://www.google.com",
+                }
+
             return [{"message": message, "raw": message, "url": u} for u in urls]
-        
+
         if task_type == "open_webcam":
             return {"message": message, "raw": message}
-        
+
         if task_type == "close_webcam":
             return {"message": message, "raw": message}
 
@@ -749,13 +1145,14 @@ Classify. Output EXACTLY ONE category name."""
     def _extract_urls(self, msg: str) -> list:
 
         from urllib.parse import urlparse
+
         msg_lower = msg.lower()
         urls, seen = [], set()
 
         def _add(u):
             if not u or u in seen:
                 return
-            
+
             u2 = u.strip().rstrip(".!?,")
             if not u2.startswith("http"):
                 u2 = "https://" + u2
@@ -764,10 +1161,10 @@ Classify. Output EXACTLY ONE category name."""
                 p = urlparse(u2)
                 if p.scheme not in ("http", "https"):
                     return
-                
+
             except Exception:
                 return
-            
+
             urls.append(u2)
             seen.add(u2)
 
@@ -780,11 +1177,15 @@ Classify. Output EXACTLY ONE category name."""
 
         if urls:
             return urls
-        
-        for prefix in ["open ", "launch ", "go to ", "visit ", "can you open "]:
 
+        for prefix in ["open ", "launch ", "go to ", "visit ", "can you open "]:
             if prefix in msg_lower:
-                rest = msg_lower.split(prefix, 1)[-1].replace(" for me", "").strip().rstrip(".!?")
+                rest = (
+                    msg_lower.split(prefix, 1)[-1]
+                    .replace(" for me", "")
+                    .strip()
+                    .rstrip(".!?")
+                )
 
                 if rest:
                     for p in re.split(r"\s+and\s+|\s*,\s*", rest):
@@ -808,36 +1209,38 @@ Classify. Output EXACTLY ONE category name."""
         cleaned = self._strip_filler(msg)
         lower = cleaned.lower()
 
-        m = re.search(r'^(.+?)\s+(?:can you|could you|please)\s+play\s+(?:that|it|this)\b', lower)
+        m = re.search(
+            r"^(.+?)\s+(?:can you|could you|please)\s+play\s+(?:that|it|this)\b", lower
+        )
 
         if m:
-            result = cleaned[:m.end(1)].strip().rstrip(".!?,")
+            result = cleaned[: m.end(1)].strip().rstrip(".!?,")
             if result:
                 return result
 
         m = re.search(
-            r'(?:can you|could you|please)\s+play\s+(?:the\s+|a\s+|some\s+|me\s+)?(.+?)(?:\s+on\s+youtube|\s+for\s+me|\s+please\s*)?\s*[.!?]*$',
+            r"(?:can you|could you|please)\s+play\s+(?:the\s+|a\s+|some\s+|me\s+)?(.+?)(?:\s+on\s+youtube|\s+for\s+me|\s+please\s*)?\s*[.!?]*$",
             lower,
         )
 
         if m:
-            result = cleaned[m.start(1):m.end(1)].strip().rstrip(".!?,")
+            result = cleaned[m.start(1) : m.end(1)].strip().rstrip(".!?,")
             if result and result.lower() not in ("that", "it", "this", "something"):
                 return result
 
         m = re.search(
-            r'play\s+(?:the\s+|a\s+|some\s+|me\s+)?(.+?)(?:\s+on\s+youtube|\s+for\s+me|\s+please\s*)?\s*[.!?]*$',
+            r"play\s+(?:the\s+|a\s+|some\s+|me\s+)?(.+?)(?:\s+on\s+youtube|\s+for\s+me|\s+please\s*)?\s*[.!?]*$",
             lower,
         )
-        
+
         if m:
-            result = cleaned[m.start(1):m.end(1)].strip().rstrip(".!?,")
+            result = cleaned[m.start(1) : m.end(1)].strip().rstrip(".!?,")
             if result and result.lower() not in ("that", "it", "this", "something"):
                 return result
 
         for p in ["play ", "play the ", "play some ", "play a "]:
             if lower.startswith(p):
-                return cleaned[len(p):].strip().rstrip(".!?")
+                return cleaned[len(p) :].strip().rstrip(".!?")
 
         return cleaned.strip()
 
@@ -846,29 +1249,44 @@ Classify. Output EXACTLY ONE category name."""
         m, lower = msg.strip(), msg.lower()
         extracted = None
 
-        for p in ["generate ", "draw ", "create ", "make me ", "make a ", "picture of ", "image of ", "generator image of "]:
+        for p in [
+            "generate ",
+            "draw ",
+            "create ",
+            "make me ",
+            "make a ",
+            "picture of ",
+            "image of ",
+            "generator image of ",
+        ]:
             if lower.startswith(p):
-                extracted = m[len(p):].strip().rstrip(".!?")
+                extracted = m[len(p) :].strip().rstrip(".!?")
                 break
 
             if p in lower:
-                extracted = m[lower.find(p) + len(p):].strip().rstrip(".!?")
+                extracted = m[lower.find(p) + len(p) :].strip().rstrip(".!?")
                 break
 
         if not extracted:
             return m
-        
+
         boundaries = [
-            r"\s+and\s+write\s", r"\s+and\s+open\s", r"\s+and\s+generate\s",
-            r"\s+and\s+draw\s", r"\s+and\s+play\s", r"\s+and\s+search\s",
-            r"\s+and\s+launch\s", r"\s+and\s+go\s+to\s", r"\s+and\s+visit\s",
+            r"\s+and\s+write\s",
+            r"\s+and\s+open\s",
+            r"\s+and\s+generate\s",
+            r"\s+and\s+draw\s",
+            r"\s+and\s+play\s",
+            r"\s+and\s+search\s",
+            r"\s+and\s+launch\s",
+            r"\s+and\s+go\s+to\s",
+            r"\s+and\s+visit\s",
         ]
 
         for b in boundaries:
             match = re.search(b, extracted.lower(), re.I)
 
             if match:
-                extracted = extracted[:match.start()].strip().rstrip(".!?,")
+                extracted = extracted[: match.start()].strip().rstrip(".!?,")
                 break
 
         return extracted.strip() if extracted.strip() else m
@@ -878,45 +1296,64 @@ Classify. Output EXACTLY ONE category name."""
         cleaned = self._strip_filler(msg)
         lower = cleaned.lower()
 
-        for p in ["search youtube for ", "search youtube ", "youtube search for ",
-                   "search on youtube for ", "search on youtube ",
-                   "search google for ", "search on google for ", "search on google ",
-                   "search for ", "look up ", "find me ", "find ",
-                   "google search for ", "google search ", "google "]:
-            
+        for p in [
+            "search youtube for ",
+            "search youtube ",
+            "youtube search for ",
+            "search on youtube for ",
+            "search on youtube ",
+            "search google for ",
+            "search on google for ",
+            "search on google ",
+            "search for ",
+            "look up ",
+            "find me ",
+            "find ",
+            "google search for ",
+            "google search ",
+            "google ",
+        ]:
             if p in lower:
-                rest = cleaned[lower.find(p) + len(p):].strip().rstrip(".!?")
+                rest = cleaned[lower.find(p) + len(p) :].strip().rstrip(".!?")
                 return rest if rest else cleaned.strip()
 
         m = re.search(
-            r'(?:can you|could you|please)\s+search\s+(?:for\s+)?(.+?)(?:\s+on\s+(?:youtube|google)|\s+for\s+me|\s+please\s*)?\s*[.!?]*$',
+            r"(?:can you|could you|please)\s+search\s+(?:for\s+)?(.+?)(?:\s+on\s+(?:youtube|google)|\s+for\s+me|\s+please\s*)?\s*[.!?]*$",
             lower,
         )
 
         if m:
-            result = cleaned[m.start(1):m.end(1)].strip().rstrip(".!?,")
+            result = cleaned[m.start(1) : m.end(1)].strip().rstrip(".!?,")
             if result:
                 return result
 
-        m = re.search(r'^(.+?)\s+on\s+(?:youtube|google)\s*[.!?]*$', lower)
+        m = re.search(r"^(.+?)\s+on\s+(?:youtube|google)\s*[.!?]*$", lower)
 
         if m:
-            result = cleaned[:m.end(1)].strip().rstrip(".!?,")
+            result = cleaned[: m.end(1)].strip().rstrip(".!?,")
 
             if result:
                 result2 = re.sub(
-                    r'^(?:can you |could you |please )?(?:play|search|find|look up)\s+(?:the\s+|a\s+|some\s+|me\s+)?',
-                    '', result, flags=re.I
+                    r"^(?:can you |could you |please )?(?:play|search|find|look up)\s+(?:the\s+|a\s+|some\s+|me\s+)?",
+                    "",
+                    result,
+                    flags=re.I,
                 ).strip()
                 return result2 if result2 else result
 
         stripped = re.sub(
-            r'^(?:can you |could you |please )?(?:play|search|find|look up)\s+(?:the\s+|a\s+|some\s+|me\s+)?',
-            '', lower, flags=re.I
+            r"^(?:can you |could you |please )?(?:play|search|find|look up)\s+(?:the\s+|a\s+|some\s+|me\s+)?",
+            "",
+            lower,
+            flags=re.I,
         ).strip()
 
-        stripped = re.sub(r'\s+on\s+(?:youtube|google)\s*[.!?]*$', '', stripped, flags=re.I).strip()
-        stripped = re.sub(r'\s+(?:for me|please)\s*[.!?]*$', '', stripped, flags=re.I).strip()
+        stripped = re.sub(
+            r"\s+on\s+(?:youtube|google)\s*[.!?]*$", "", stripped, flags=re.I
+        ).strip()
+        stripped = re.sub(
+            r"\s+(?:for me|please)\s*[.!?]*$", "", stripped, flags=re.I
+        ).strip()
 
         if stripped and stripped != lower:
             return stripped.rstrip(".!?,")
@@ -926,17 +1363,35 @@ Classify. Output EXACTLY ONE category name."""
 
         m, lower = msg.strip(), msg.lower()
         boundaries = [
-            r"\s+and\s+open\s", r"\s+and\s+generate\s", r"\s+and\s+draw\s",
-            r"\s+and\s+play\s", r"\s+and\s+search\s", r"\s+and\s+launch\s",
-            r"\s+and\s+go\s+to\s", r"\s+and\s+visit\s",
+            r"\s+and\s+open\s",
+            r"\s+and\s+generate\s",
+            r"\s+and\s+draw\s",
+            r"\s+and\s+play\s",
+            r"\s+and\s+search\s",
+            r"\s+and\s+launch\s",
+            r"\s+and\s+go\s+to\s",
+            r"\s+and\s+visit\s",
         ]
 
         triggers = [
-            "write application", "write an application", "write a application",
-            "write a letter", "write letter", "draft a letter", "draft letter",
-            "write an essay", "write essay", "write a poem", "write poem",
-            "write a song", "write song", "compose a", "write the following",
-            "write ", "draft ", "compose ",
+            "write application",
+            "write an application",
+            "write a application",
+            "write a letter",
+            "write letter",
+            "draft a letter",
+            "draft letter",
+            "write an essay",
+            "write essay",
+            "write a poem",
+            "write poem",
+            "write a song",
+            "write song",
+            "compose a",
+            "write the following",
+            "write ",
+            "draft ",
+            "compose ",
         ]
 
         best_start = -1
@@ -950,7 +1405,7 @@ Classify. Output EXACTLY ONE category name."""
 
         if best_start < 0:
             return m
-        
+
         segment = m[best_start:].strip()
         segment_lower = segment.lower()
 
@@ -958,8 +1413,100 @@ Classify. Output EXACTLY ONE category name."""
             match = re.search(b, segment_lower, re.I)
 
             if match:
-                segment = segment[:match.start()].strip().rstrip(".!?,")
+                segment = segment[: match.start()].strip().rstrip(".!?,")
                 break
-            
+
         segment = segment.rstrip(".!?,").strip()
         return segment if segment else m
+
+    def assess_clarification_need(
+        self,
+        user_message: str,
+        chat_history: Optional[List[Tuple[str, str]]] = None,
+    ) -> Optional[Dict]:
+        msg = (user_message or "").strip()
+        if not msg:
+            return None
+
+        vague_signals = [
+            "do that",
+            "make it better",
+            "the other one",
+            "that thing",
+            "finance thing",
+            "the file",
+            "my list",
+            "improve it",
+            "fix it",
+            "the website",
+            "open google",
+            "financial report",
+        ]
+        lower_msg = msg.lower()
+        needs_clarification = any(sig in lower_msg for sig in vague_signals)
+
+        if not needs_clarification:
+            confidence = self._estimate_confidence(msg)
+            if confidence < CLARIFICATION_THRESHOLD:
+                needs_clarification = True
+
+        if not needs_clarification:
+            return None
+
+        return self._generate_clarification(msg)
+
+    def _estimate_confidence(self, msg: str) -> float:
+        m_lower = msg.lower()
+        vague_score = 0.0
+        if any(x in m_lower for x in ["do that", "make it", "the other", "that thing"]):
+            vague_score += 0.4
+        if (
+            any(x in m_lower for x in ["what is", "who is", "where is"])
+            and len(msg.split()) < 5
+        ):
+            vague_score += 0.2
+        if len(msg.split()) < 3:
+            vague_score += 0.3
+        return max(0.0, 1.0 - vague_score)
+
+    def _generate_clarification(self, msg: str) -> Dict:
+        import json
+
+        lower_msg = msg.lower()
+
+        if "financial" in lower_msg or "finance" in lower_msg:
+            return {
+                "needs_clarification": True,
+                "question": "What type of financial report?",
+                "options": [
+                    "Personal finance summary",
+                    "Company analysis",
+                    "Stock market report",
+                ],
+                "recommended_mode": "task",
+            }
+        if "improve" in lower_msg or "better" in lower_msg:
+            return {
+                "needs_clarification": True,
+                "question": "In what way should I improve it?",
+                "options": [
+                    "Better wording",
+                    "More detail",
+                    "Shorter version",
+                    "More technical",
+                ],
+                "recommended_mode": "general",
+            }
+        if any(x in lower_msg for x in ["open", "website", "go to"]):
+            return {
+                "needs_clarification": True,
+                "question": "Which website?",
+                "options": ["Google", "Facebook", "YouTube", "Other"],
+                "recommended_mode": "task",
+            }
+        return {
+            "needs_clarification": True,
+            "question": "Could you clarify what you'd like?",
+            "options": ["Yes, continue", "Let me rephrase"],
+            "recommended_mode": "general",
+        }
