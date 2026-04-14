@@ -6,6 +6,11 @@ const API = (typeof window !== 'undefined' && window.location.origin)
 let sessionId = null;
 let currentMode = 'natasha';
 let isStreaming = false;
+let awaitingClarification = false;
+let pendingClarificationId = null;
+let pendingClarificationPayload = null;
+let clarificationOptions = [];
+let thinkingMode = false;
 let isListening = false;
 let camStream = null;
 let autoListenMode = false;
@@ -488,7 +493,7 @@ const CAMERA_QUERY_PATTERNS = [
     /what\s+(can|do)\s+you\s+see/i,
     /can\s+you\s+see/i,
     /describe\s+(what\s+you\s+see|this|the\s+image)/i,
-    /what('s|s)\sss+in\sss+(this\sss+)?(picture|image)/i,
+    /what('s|s)\s+in\s+(this\s+)?(picture|image)/i,
     /what\s+do\s+i\s+look\s+like/i,
     /what\s+(am\s+i\s+)?holding/i,
     /show\s+me\s+what\s+you\s+see/i,
@@ -496,8 +501,9 @@ const CAMERA_QUERY_PATTERNS = [
 function isCameraQuery(text) {
     if (!text || typeof text !== 'string') return false;
     const t = text.trim().toLowerCase();
-    return CAMERA_QUERY_PATTERNS.some(r => r.test(t)) ||
-        (t.includes('see') && (t.includes('what') || t.includes('describe')));
+    if (CAMERA_QUERY_PATTERNS.some(r => r.test(t))) return true;
+    if (t.includes('look at') || t.includes('take a look at') || t.includes('check out')) return true;
+    return false;
 }
 
 function startCamera() {
@@ -963,10 +969,36 @@ function showToast(msg, durationMs = 5000) {
 }
 
 function bindEvents() {
-    if (sendBtn) sendBtn.addEventListener('click', () => { if (!isStreaming) sendMessage(); });
-    if (messageInput) messageInput.addEventListener('keydown', e => {
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isStreaming) sendMessage(); }
-    });
+    console.log('[NATASHA] Binding events, sendBtn:', sendBtn, 'messageInput:', messageInput);
+    const thinkBtn = document.getElementById('think-btn');
+    if (thinkBtn) {
+        console.log('[NATASHA] Think button found');
+        thinkBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            thinkingMode = !thinkingMode;
+            thinkBtn.classList.toggle('active', thinkingMode);
+            console.log('[NATASHA] Thinking toggled:', thinkingMode);
+        };
+    } else {
+        console.log('[NATASHA] Think button NOT found in DOM!');
+    }
+    if (sendBtn) {
+        sendBtn.addEventListener('click', () => { 
+            console.log('[NATASHA] Send button clicked, isStreaming:', isStreaming); 
+            if (!isStreaming) sendMessage(); 
+        });
+    }
+    if (messageInput) {
+        messageInput.addEventListener('keydown', e => {
+            console.log('[NATASHA] Keydown:', e.key, 'shiftKey:', e.shiftKey);
+            if (e.key === 'Enter' && !e.shiftKey) { 
+                e.preventDefault(); 
+                console.log('[NATASHA] Enter pressed, calling sendMessage');
+                if (!isStreaming) sendMessage(); 
+            }
+        });
+    }
     if (messageInput) messageInput.addEventListener('input', () => {
         autoResizeInput();
         const len = messageInput.value.length;
@@ -998,7 +1030,6 @@ function bindEvents() {
         if (ttsPlayer && !ttsPlayer.enabled) ttsPlayer.stop();
     });
     if (newChatBtn) newChatBtn.addEventListener('click', newChat);
-    if (btnNatasha) btnNatasha.addEventListener('click', () => setMode('natasha'));
     document.querySelectorAll('.chip').forEach(c => {
         c.addEventListener('click', () => { if (!isStreaming) sendMessage(c.dataset.msg); });
     });
@@ -1071,22 +1102,14 @@ function updatePanelOverlay() {
 
 function getEndpointForMode(mode) {
     if (mode === 'realtime') return '/realtime/stream';
+    if (mode === 'thinking') return '/chat/thinking/stream';
     if (mode === 'general') return '/chat/stream';
-    return '/chat/natasha/stream';
+    if (mode === 'natasha') return '/chat/natasha/stream';
+    return '/chat/stream';
 }
 
 function setMode(mode) {
     currentMode = mode || 'natasha';
-    if (btnNatasha) {
-        const buttons = document.querySelectorAll('.mode-btn');
-        buttons.forEach(b => b.classList.remove('active'));
-        if (mode === 'natasha' && btnNatasha) btnNatasha.classList.add('active');
-    }
-    if (modeSlider) {
-        modeSlider.classList.remove('center', 'right');
-        if (mode === 'general') modeSlider.classList.add('center');
-        else if (mode === 'realtime') modeSlider.classList.add('right');
-    }
     if (activityToggle) activityToggle.style.display = '';
 }
 
@@ -1380,7 +1403,9 @@ function scrollToBottom() {
 }
 
 async function sendMessage(textOverride) {
+    console.log('[NATASHA] sendMessage called, textOverride:', textOverride);
     let text = (textOverride || messageInput.value).trim();
+    console.log('[NATASHA] text to send:', text);
     const visionModeOn = camVisionModeInput && camVisionModeInput.checked;
     const wantsCamera = visionModeOn || isCameraQuery(text) || (camStream && text);
     if (wantsCamera && !text) text = 'What do you see?';
@@ -1420,7 +1445,8 @@ async function sendMessage(textOverride) {
     if (orbContainer) orbContainer.classList.add('active');
     if (ttsPlayer) { ttsPlayer.reset(); ttsPlayer.unlock(); }
     const messageToSend = imgBase64 ? (text + ' ' + CAM_BYPASS_TOKEN) : text;
-    const endpoint = getEndpointForMode(currentMode);
+    const endpoint = thinkingMode ? '/chat/thinking/stream' : '/chat/natasha/stream';
+    console.log('[NATASHA] Sending to:', endpoint, 'thinkingMode:', thinkingMode);
     if (activityList) {
         activityList.innerHTML = '<div class="activity-empty" id="activity-empty">Processing...</div>';
         if (activityToggle) activityToggle.style.display = '';
@@ -1441,7 +1467,7 @@ async function sendMessage(textOverride) {
                 message: messageToSend,
                 session_id: sessionId,
                 tts: !!(ttsPlayer && ttsPlayer.enabled),
-                imgbase64: imgBase64 || null
+                img_base64: imgBase64 || null
             }),
             signal: controller.signal,
         });
@@ -1490,6 +1516,33 @@ async function sendMessage(textOverride) {
                     }
                     if (data.background_tasks) {
                         handleBackgroundTasks(data.background_tasks, contentEl);
+                    }
+                    if (data.type === 'clarification' || data.clarification) {
+                        awaitingClarification = true;
+                        clarificationOptions = data.options || [];
+                        const question = data.question || 'Could you clarify?';
+                        const optionChips = document.createElement('div');
+                        optionChips.className = 'clarification-options';
+                        optionChips.innerHTML = '<div class="clarification-question">' + escapeHtml(question) + '</div>';
+                        clarificationOptions.forEach(opt => {
+                            const btn = document.createElement('button');
+                            btn.className = 'chip clarification-chip';
+                            btn.textContent = opt;
+                            btn.addEventListener('click', () => {
+                                if (isStreaming) return;
+                                awaitingClarification = false;
+                                optionChips.remove();
+                                sendMessage(opt);
+                            });
+                            optionChips.appendChild(btn);
+                        });
+                        if (contentEl) {
+                            const textSpan = contentEl.querySelector('.msg-stream-text');
+                            if (textSpan) textSpan.textContent = fullResponse;
+                            contentEl.appendChild(optionChips);
+                        }
+                        streamDone = true;
+                        break;
                     }
                     if ('chunk' in data) {
                         const chunkText = data.chunk || '';
