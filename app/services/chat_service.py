@@ -247,6 +247,120 @@ class ChatService:
         )
         return response
 
+    def process_thinking_stream(
+        self,
+        session_id: str,
+        user_message: str,
+        force_clarify: bool = False,
+        clarification_choice: Optional[str] = None,
+    ) -> Iterator[Union[str, Dict[Any, Any]]]:
+        if not self.brain_service:
+            raise RuntimeError("Brain service is not initialized.")
+
+        logger.info(
+            "[THINKING STREAM] Session ID: %s | User: %s", session_id, user_message
+        )
+
+        self.add_message(session_id, "user", user_message)
+
+        yield {"activity": "event", "query_detected": True, "message": user_message}
+        yield {"activity": "event", "routing": True, "route": "thinking"}
+
+        chat_history = self.format_history_for_llm(session_id, exclude_last=True)
+
+        if clarification_choice:
+            key_idx, _ = get_next_key_pair(len(GROQ_API_KEYS), need_brain=False)
+            category, _, method, elapsed_ms = self.brain_service.classify(
+                f"{user_message}\n\nUser chose: {clarification_choice}",
+                chat_history,
+                key_index=key_idx or 0,
+            )
+            yield {
+                "activity": "event",
+                "clarification_confirmed": True,
+                "choice": clarification_choice,
+            }
+
+            for chunk in self.process_message_stream(session_id, user_message):
+                if isinstance(chunk, dict):
+                    yield chunk
+                    continue
+                yield chunk
+            return
+
+        key_idx, chat_idx = get_next_key_pair(
+            len(GROQ_API_KEYS), need_brain=bool(self.brain_service)
+        )
+
+        t0 = time.perf_counter()
+        category, task_types, primary_method, elapsed_ms = self.brain_service.classify(
+            user_message,
+            chat_history,
+            key_index=key_idx if key_idx is not None else 0,
+        )
+
+        yield {
+            "activity": "event",
+            "decision_query_type": True,
+            "category": category,
+            "primary_method": primary_method.capitalize(),
+            "elapsed_ms": elapsed_ms,
+        }
+
+        from app.config import (
+            THINKING_MODE_ENABLED,
+            CLARIFICATION_THRESHOLD,
+        )
+
+        broad_queries = [
+            "analysis",
+            "market",
+            "stock",
+            "help",
+            "something",
+            "anything",
+            "tell me about",
+            "what about",
+            "give me",
+            "create",
+            "make",
+        ]
+        is_broad = (
+            any(word in user_message.lower() for word in broad_queries)
+            and len(user_message.split()) < 10
+        )
+
+        needs_clarification = (
+            force_clarify
+            or (THINKING_MODE_ENABLED and category in ["general", "realtime"])
+            or is_broad
+        )
+
+        if needs_clarification and not task_types:
+            clarify_result = self.brain_service.assess_clarification_need(
+                user_message, chat_history
+            )
+
+            if clarify_result and clarify_result.get("needs_clarification"):
+                yield {
+                    "activity": "event",
+                    "clarification_requested": True,
+                    "question": clarify_result.get("question"),
+                    "options": clarify_result.get("options", []),
+                }
+                yield {
+                    "type": "clarification",
+                    "question": clarify_result.get("question"),
+                    "options": clarify_result.get("options", []),
+                }
+                return
+
+        for chunk in self.process_message_stream(session_id, user_message):
+            if isinstance(chunk, dict):
+                yield chunk
+                continue
+            yield chunk
+
     def process_realtime_stream(
         self, session_id: str, user_message: str
     ) -> Iterator[Any]:
